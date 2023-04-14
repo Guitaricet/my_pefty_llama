@@ -59,7 +59,6 @@ class LLaMAModel(nn.Module):
     def from_pretrained(cls, model_name_or_path, use_8bit=False):
         """Load model from a huggingface model name or path."""
         hf_config = HF_LlamaConfig.from_pretrained(model_name_or_path)
-        assert hf_config.intermediate_size == 4 * hf_config.hidden_size
 
         config = LLaMAConfig(
             vocab_size=hf_config.vocab_size,

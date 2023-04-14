@@ -3,3 +3,4 @@ tqdm
 transformers
 accelerate
 bitsandbytes
+sentencepiece

@@ -28,8 +28,8 @@ class IA3Attention(nn.Module):
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
         # IA3-specific parameters:
-        self.peft_l_k = nn.Parameter(torch.ones(1, 1, config.dim))
-        self.peft_l_v = nn.Parameter(torch.ones(1, 1, config.dim))
+        self.peft_l_k = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim, dtype=config.dtype))
+        self.peft_l_v = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim, dtype=config.dtype))
 
     def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
         """
@@ -99,7 +99,7 @@ class IA3MLP(nn.Module):
             self.down_proj = NoInitLinear(hidden_dim, dim, bias=False, dtype=config.dtype)
 
         # IA3-specific parameters:
-        self.peft_l_ffn = nn.Parameter(torch.ones(1, 1, dim))
+        self.peft_l_ffn = nn.Parameter(torch.ones(1, 1, hidden_dim, dtype=config.dtype))
 
     def forward(self, x):
         h = F.silu(self.gate_proj(x)) * self.up_proj(x)
@@ -111,21 +111,24 @@ class IA3MLP(nn.Module):
 
 class IA3(nn.Module):
     def __init__(self, model: LLaMAModel):
+        super().__init__()
         self.base_model = model
+        model_config = model.config
 
         for layer in self.base_model.model.layers:
             # you also need to copy the parameters of the layer to the new layer
-            patched_attn = IA3Attention(layer.attn.config)
-            current_attn = layer.attn
-            patched_attn.q_proj.weight = current_attn.attn.q_proj.weight
-            patched_attn.k_proj.weight = current_attn.attn.k_proj.weight
-            patched_attn.v_proj.weight = current_attn.attn.v_proj.weight
-            patched_attn.o_proj.weight = current_attn.attn.o_proj.weight
+            patched_attn = IA3Attention(model_config)
+            current_attn = layer.self_attn
+            patched_attn.q_proj.weight = current_attn.q_proj.weight
+            patched_attn.k_proj.weight = current_attn.k_proj.weight
+            patched_attn.v_proj.weight = current_attn.v_proj.weight
+            patched_attn.o_proj.weight = current_attn.o_proj.weight
+            patched_attn.rotary_emb = current_attn.rotary_emb
 
             layer.self_attn = patched_attn
             del current_attn
 
-            patched_mlp = IA3MLP(layer.mlp.config)
+            patched_mlp = IA3MLP(model_config)
             current_mlp = layer.mlp
             patched_mlp.gate_proj.weight = current_mlp.gate_proj.weight
             patched_mlp.up_proj.weight = current_mlp.up_proj.weight
@@ -143,5 +146,6 @@ class IA3(nn.Module):
             if "peft_" in name: continue
             param.requires_grad = False
 
-        # monkey patch the forward method
+        # monkey patch the methods
         self.forward = self.base_model.forward
+        self.generate = self.base_model.generate
