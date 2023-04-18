@@ -159,8 +159,8 @@ class IA3ForAttn(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
-        self.peft_l_k = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim, dtype=config.dtype))
-        self.peft_l_v = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim, dtype=config.dtype))
+        self.peft_l_k = nn.Parameter(torch.ones(config.dim, dtype=config.dtype))
+        self.peft_l_v = nn.Parameter(torch.ones(config.dim, dtype=config.dtype))
 
     def forward(self, key_states, value_states):
         return key_states * self.peft_l_k, value_states * self.peft_l_v
