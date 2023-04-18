@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 PEFT_PREFIX = "prefix"
 PEFT_PROMPT = "prompt"
@@ -15,22 +15,22 @@ ADAPTER_VERSION_PFEIFFER = "pfeiffer"
 
 @dataclass
 class PeftConfig:
-    peft_mode: str
+    peft_mode: str = field()
 
     # Used by prompt, prefix, prefix_adapter
-    num_prefix_tokens: int = 16
+    num_prefix_tokens: int = field(default=16)
 
     # Prefix
-    prefix_use_mlp: bool = True
-    prefix_mlp_intermediate_size: int = None
+    prefix_use_mlp: bool = field(default=True)
+    prefix_mlp_intermediate_size: int = field(default=None)
 
     # LoRA
-    lora_rank: int = 8
-    lora_alpha: int = 16
+    lora_rank: int = field(default=8)
+    lora_alpha: int = field(default=16)
 
     # Adapter
-    adapter_hidden_size: int = 64
-    adapter_version: str = ADAPTER_VERSION_PFEIFFER  # houlsby, pfeiffer
+    adapter_hidden_size: int = field(default=64)
+    adapter_version: str = field(default=ADAPTER_VERSION_PFEIFFER)  # houlsby, pfeiffer
 
     def check(self):
         assert self.peft_mode in (

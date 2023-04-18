@@ -75,12 +75,22 @@ class LLaMAModel(nn.Module):
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        if self.peft_config.peft_mode in (peft.PEFT_PREFIX, peft.PEFT_PROMPT):
+        input_ids_for_rope = input_ids
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
             attention_mask = torch.cat([
                 zeros_like([1, 1, input_ids.shape[1], self.peft_config.num_prefix_tokens], tensor=attention_mask),
                 attention_mask,
             ], dim=3)
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+
+        if self.peft_config.peft_mode in peft.PEFT_PROMPT:
+            input_ids_for_rope = torch.cat([
+                torch.ones([input_ids.shape[0], self.peft_config.num_prefix_tokens],
+                           dtype=input_ids.dtype, device=input_ids.device),
+                input_ids,
+            ], dim=1)
+            # Easier to just remake the attention mask
+            attention_mask = create_attention_mask(input_ids=input_ids_for_rope, dtype=self.config.dtype)
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids_for_rope)
         cos, sin = self.get_cos_sin(rope_embed_ids)
 
         if self.peft_config.peft_mode == peft.PEFT_PREFIX:
@@ -159,6 +169,7 @@ class LLaMAModel(nn.Module):
         # 2) First encoding
         # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        input_ids_for_rope = input_ids
         # dict(
         #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
         #   kv_cache = list[dict(
@@ -175,7 +186,15 @@ class LLaMAModel(nn.Module):
                 attention_mask,
             ], dim=3)
 
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        if self.peft_config.peft_mode in peft.PEFT_PROMPT:
+            input_ids_for_rope = torch.cat([
+                torch.ones([input_ids.shape[0], self.peft_config.num_prefix_tokens],
+                           dtype=input_ids.dtype, device=input_ids.device),
+                input_ids,
+            ], dim=1)
+            # Easier to just remake the attention mask
+            attention_mask = create_attention_mask(input_ids=input_ids_for_rope, dtype=self.config.dtype)
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids_for_rope)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         model_out = self.model(
             input_ids=input_ids,
@@ -247,6 +266,15 @@ class LLaMAModel(nn.Module):
         cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         return cos, sin
 
+    def gradient_checkpointing_enable(self):
+        self.config.gradient_checkpointing = True
+
+    def enable_input_require_grads(self):
+        def make_inputs_require_grads(module, input, output):
+            output.requires_grad_(True)
+        self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
+
+
 
 class LLaMAInnerModel(nn.Module):
     def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
@@ -273,7 +301,7 @@ class LLaMAInnerModel(nn.Module):
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
         :param kv_cache: See init_kv_cache.
         :param cos: for RoPE
-        :param sin:for RoPE
+        :param sin: for RoPE
         """
         hidden_states = self.embed_tokens(input_ids)
         if self.peft_config.peft_mode == peft.PEFT_PROMPT:
@@ -292,12 +320,22 @@ class LLaMAInnerModel(nn.Module):
             else:
                 layer_kv_cache = None
 
-            layer_out = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                kv_cache=layer_kv_cache,
-                cos=cos, sin=sin,
-            )
+            if self.config.gradient_checkpointing:
+                layer_out = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    attention_mask,
+                    kv_cache,
+                    cos, sin,
+                )
+            else:
+                layer_out = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    kv_cache=layer_kv_cache,
+                    cos=cos, sin=sin,
+                )
+
             hidden_states = layer_out["hidden_states"]
             if kv_cache:
                 new_kv_cache.append(layer_out["kv_cache"])

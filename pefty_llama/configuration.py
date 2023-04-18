@@ -14,6 +14,7 @@ class LLaMAConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
     use_8bit: bool = False
+    gradient_checkpointing: bool = False
 
     @property
     def head_dim(self):
