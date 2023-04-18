@@ -149,7 +149,7 @@ class LLaMAModel(nn.Module):
         # See: init_kv_cache. list[dict]
         if self.peft_config.peft_mode == peft.PEFT_PREFIX:
             kv_cache = self.peft_prefixes(batch_size=input_ids.shape[0])
-            num_valid_kv_cache = num_valid_tokens + self.downstream_config.num_prefix_tokens
+            num_valid_kv_cache = num_valid_tokens + self.peft_config.num_prefix_tokens
         else:
             kv_cache = self.init_kv_cache(input_ids)
             num_valid_kv_cache = num_valid_tokens
