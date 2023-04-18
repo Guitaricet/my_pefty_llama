@@ -478,6 +478,8 @@ class Attention(nn.Module):
             self.peft_k_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
             self.peft_v_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
             self.peft_o_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX_ADAPTER:
+            self.peft_prefix_adapter = peft.PEFT_PREFIX_ADAPTER(config=config, peft_config=peft_config)
 
     def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
         """
@@ -519,6 +521,10 @@ class Attention(nn.Module):
             value=value_states,
             attn_mask=attention_mask,
         )
+
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX_ADAPTER:
+            attn_output = attn_output + self.peft_prefix_adapter(query_states=query_states)
+
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
