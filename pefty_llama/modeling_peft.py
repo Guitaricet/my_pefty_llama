@@ -18,43 +18,20 @@ from transformers import (
     LlamaConfig as HF_LlamaConfig,
     LlamaForCausalLM as HF_Llama,
 )
-
-
-@dataclasses.dataclass
-class LLaMAConfig:
-    dim: int
-    n_layers: int
-    n_heads: int
-    vocab_size: int = 32000
-    max_seq_length: int = 2048
-    dtype = torch.float16
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    use_8bit: bool = False
-
-    @property
-    def head_dim(self):
-        return self.dim // self.n_heads
-
-
-LLAMA_7B_CONFIG = LLaMAConfig(
-    dim=4096,
-    n_layers=32,
-    n_heads=32,
-)
-
-LLAMA_CONFIG_DICT = {
-    "7b": LLAMA_7B_CONFIG,
-}
+import pefty_llama.peft as peft
+from pefty_llama.configuration import LLaMAConfig, LLAMA_CONFIG_DICT
 
 
 class LLaMAModel(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
         super().__init__()
         self.config = config
-        self.model = LLaMAInnerModel(config)
+        self.peft_config = peft_config
+        self.model = LLaMAInnerModel(config=config, peft_config=peft_config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
+
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            self.peft_prefixes = peft.SoftPrefixes(config=config, peft_config=peft_config)
 
     @classmethod
     def from_pretrained(cls, model_name_or_path, use_8bit=False):
@@ -98,8 +75,28 @@ class LLaMAModel(nn.Module):
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        input_ids_for_rope = input_ids
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            attention_mask = torch.cat([
+                zeros_like([1, 1, input_ids.shape[1], self.peft_config.num_prefix_tokens], tensor=attention_mask),
+                attention_mask,
+            ], dim=3)
+
+        if self.peft_config.peft_mode in peft.PEFT_PROMPT:
+            input_ids_for_rope = torch.cat([
+                torch.ones([input_ids.shape[0], self.peft_config.num_prefix_tokens],
+                           dtype=input_ids.dtype, device=input_ids.device),
+                input_ids,
+            ], dim=1)
+            # Easier to just remake the attention mask
+            attention_mask = create_attention_mask(input_ids=input_ids_for_rope, dtype=self.config.dtype)
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids_for_rope)
         cos, sin = self.get_cos_sin(rope_embed_ids)
+
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            kv_cache = self.peft_prefixes(batch_size=input_ids.shape[0])
+        else:
+            kv_cache = None
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
@@ -107,6 +104,7 @@ class LLaMAModel(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             cos=cos, sin=sin,
+            kv_cache=kv_cache,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
@@ -159,13 +157,19 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        kv_cache = self.init_kv_cache(input_ids)
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            kv_cache = self.peft_prefixes(batch_size=input_ids.shape[0])
+            num_valid_kv_cache = num_valid_tokens + self.peft_config.num_prefix_tokens
+        else:
+            kv_cache = self.init_kv_cache(input_ids)
+            num_valid_kv_cache = num_valid_tokens
         generated_token_ids_list = [original_input_ids]
         total_seq_len = seq_len
 
         # 2) First encoding
         # [batch_size=1, num_heads=1, q_len=1, kv_len=1]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        input_ids_for_rope = input_ids
         # dict(
         #   hidden_states = [batch_size, dec_seq_len=decode_step+1, hidden_dim]
         #   kv_cache = list[dict(
@@ -173,7 +177,24 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
-        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
+        if self.peft_config.peft_mode in (peft.PEFT_PREFIX, peft.PEFT_PROMPT):
+            num_prefix_tokens = self.peft_config.num_prefix_tokens
+            total_seq_len += num_prefix_tokens
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=num_prefix_tokens + dec_seq_len]
+            attention_mask = torch.cat([
+                zeros_like([1, 1, input_ids.shape[1], num_prefix_tokens], tensor=attention_mask),
+                attention_mask,
+            ], dim=3)
+
+        if self.peft_config.peft_mode in peft.PEFT_PROMPT:
+            input_ids_for_rope = torch.cat([
+                torch.ones([input_ids.shape[0], self.peft_config.num_prefix_tokens],
+                           dtype=input_ids.dtype, device=input_ids.device),
+                input_ids,
+            ], dim=1)
+            # Easier to just remake the attention mask
+            attention_mask = create_attention_mask(input_ids=input_ids_for_rope, dtype=self.config.dtype)
+        rope_embed_ids = create_rope_embed_ids(input_ids=input_ids_for_rope)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         model_out = self.model(
             input_ids=input_ids,
@@ -194,9 +215,9 @@ class LLaMAModel(nn.Module):
         for layer_kv_cache in kv_cache:
             for i in range(batch_size):
                 layer_kv_cache["key"] = shift_kv_cache_right(
-                    layer_kv_cache["key"], num_valid_tokens=num_valid_tokens)
+                    layer_kv_cache["key"], num_valid_tokens=num_valid_kv_cache)
                 layer_kv_cache["value"] = shift_kv_cache_right(
-                    layer_kv_cache["value"], num_valid_tokens=num_valid_tokens)
+                    layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
@@ -245,17 +266,30 @@ class LLaMAModel(nn.Module):
         cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         return cos, sin
 
+    def gradient_checkpointing_enable(self):
+        self.config.gradient_checkpointing = True
+
+    def enable_input_require_grads(self):
+        def make_inputs_require_grads(module, input, output):
+            output.requires_grad_(True)
+        self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
+
+
 
 class LLaMAInnerModel(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
         super().__init__()
         self.config = config
+        self.peft_config = peft_config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.dim, dtype=config.dtype)
         self.layers = nn.ModuleList([
-            LLaMALayer(config=config)
+            LLaMALayer(config=config, peft_config=peft_config)
             for _ in range(config.n_layers)
         ])
         self.norm = RMSNorm(dim=config.dim)
+
+        if self.peft_config.peft_mode == peft.PEFT_PROMPT:
+            self.peft_prompt = peft.AddSoftPrompt(config=config, peft_config=peft_config)
 
     def forward(self,
                 input_ids,
@@ -266,11 +300,14 @@ class LLaMAInnerModel(nn.Module):
         :param input_ids: [batch_size, seq_len]
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
         :param kv_cache: See init_kv_cache.
-            We use the presence of kv_cache to determine if we're generating
-        :param cos:
-        :param sin:
+        :param cos: for RoPE
+        :param sin: for RoPE
         """
         hidden_states = self.embed_tokens(input_ids)
+        if self.peft_config.peft_mode == peft.PEFT_PROMPT:
+            if kv_cache is None or kv_cache[0]["key"].shape[2] == 0:
+                # Only add prompt if kv_cache is None (full forward pass) or if kv_cache is empty (first decode step)
+                hidden_states = self.peft_prompt(hidden_states)
 
         new_kv_cache = []
         for layer_i, layer in enumerate(self.layers):
@@ -283,12 +320,22 @@ class LLaMAInnerModel(nn.Module):
             else:
                 layer_kv_cache = None
 
-            layer_out = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                kv_cache=layer_kv_cache,
-                cos=cos, sin=sin,
-            )
+            if self.config.gradient_checkpointing:
+                layer_out = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    attention_mask,
+                    kv_cache,
+                    cos, sin,
+                )
+            else:
+                layer_out = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    kv_cache=layer_kv_cache,
+                    cos=cos, sin=sin,
+                )
+
             hidden_states = layer_out["hidden_states"]
             if kv_cache:
                 new_kv_cache.append(layer_out["kv_cache"])
@@ -302,13 +349,23 @@ class LLaMAInnerModel(nn.Module):
 
 
 class LLaMALayer(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
         super().__init__()
         self.config = config
-        self.self_attn = Attention(config=config)
-        self.mlp = MLP(config=config)
+        self.peft_config = peft_config
+        self.self_attn = Attention(config=config, peft_config=peft_config)
+        self.mlp = MLP(config=config, peft_config=peft_config)
         self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
+
+        if self.peft_config.peft_mode == peft.PEFT_ADAPTER:
+            if self.peft_config.adapter_version == "houlsby":
+                self.peft_adapter_attn = peft.Adapter(config=config, peft_config=peft_config)
+            self.peft_adapter_mlp = peft.Adapter(config=config, peft_config=peft_config)
+
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            self.peft_input_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_post_attention_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
 
     def forward(
         self,
@@ -320,6 +377,8 @@ class LLaMALayer(nn.Module):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
         normed_hidden_states = self.input_layernorm(hidden_states)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            normed_hidden_states = self.peft_input_layernorm_bias(normed_hidden_states)
         # dict(
         #   attn_output = [batch_size, seq_len, hidden_dim]
         #   kv_cache = dict(
@@ -335,11 +394,25 @@ class LLaMALayer(nn.Module):
             cos=cos, sin=sin,
         )
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + raw_self_attn_output["attn_output"]
+        attn_out = raw_self_attn_output["attn_output"]
+        if self.peft_config.peft_mode == peft.PEFT_ADAPTER \
+                and self.peft_config.adapter_version == peft.ADAPTER_VERSION_HOULSBY:
+            attn_out = self.peft_adapter_attn(attn_out)
+
+        # [batch_size, seq_len, hidden_dim]
+        hidden_states = hidden_states + attn_out
         check_nan(hidden_states)
         # 2) FFN
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        post_normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            post_normed_hidden_states = self.peft_post_attention_layernorm_bias(post_normed_hidden_states)
+
+        mlp_out = self.mlp(post_normed_hidden_states)
+        if self.peft_config.peft_mode == peft.PEFT_ADAPTER:
+            mlp_out = self.peft_adapter_mlp(mlp_out)
+
+        hidden_states = hidden_states + mlp_out
         check_nan(hidden_states)
         if kv_cache:
             return {
@@ -354,9 +427,12 @@ class MLP(nn.Module):
     def __init__(
         self,
         config: LLaMAConfig,
+        peft_config: peft.PeftConfig,
         multiple_of: int = 256,
     ):
         super().__init__()
+        self.config = config
+        self.peft_config = peft_config
         dim = config.dim
         hidden_dim = 4 * dim
         hidden_dim = int(2 * hidden_dim / 3)
@@ -371,8 +447,29 @@ class MLP(nn.Module):
             self.up_proj = NoInitLinear(dim, hidden_dim, bias=False, dtype=config.dtype)
             self.down_proj = NoInitLinear(hidden_dim, dim, bias=False, dtype=config.dtype)
 
+        if self.peft_config.peft_mode == peft.PEFT_IA3:
+            self.peft_ia3 = peft.IA3ForMLP(config)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            self.peft_gate_proj_bias = peft.BitFitAddBias(dim=hidden_dim, dtype=config.dtype)
+            self.peft_up_proj_bias = peft.BitFitAddBias(dim=hidden_dim, dtype=config.dtype)
+            self.peft_down_proj_bias = peft.BitFitAddBias(dim=dim, dtype=config.dtype)
+
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate_proj = self.gate_proj(x)
+        up_proj = self.up_proj(x)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            gate_proj = self.peft_gate_proj_bias(gate_proj)
+            up_proj = self.peft_gate_proj_bias(up_proj)
+
+        intermediate_state = F.silu(gate_proj * up_proj)
+        if self.peft_config.peft_mode == peft.PEFT_IA3:
+            intermediate_state = self.peft_ia3(intermediate_state)
+
+        down_proj = self.down_proj(intermediate_state)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            down_proj = self.peft_down_proj_bias(down_proj)
+
+        return down_proj
 
 
 class RMSNorm(torch.nn.Module):
@@ -390,9 +487,10 @@ class RMSNorm(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: peft.PeftConfig):
         super().__init__()
         self.config = config
+        self.peft_config = peft_config
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
@@ -408,6 +506,19 @@ class Attention(nn.Module):
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
+        if self.peft_config.peft_mode == peft.PEFT_LORA:
+            self.peft_q_proj_lora = peft.LoRA(config=config, peft_config=peft_config)
+            self.peft_v_proj_lora = peft.LoRA(config=config, peft_config=peft_config)
+        if self.peft_config.peft_mode == peft.PEFT_IA3:
+            self.peft_ia3 = peft.IA3ForAttn(config)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            self.peft_q_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_k_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_v_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_o_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX_ADAPTER:
+            self.peft_prefix_adapter = peft.PrefixAdapter(config=config, peft_config=peft_config)
+
     def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
         """
         precomputed_kv_hidden_states is for init (pre-compute KV activations, e.g. for added prefixes)
@@ -416,13 +527,28 @@ class Attention(nn.Module):
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        query_states = self.q_proj(hidden_states).view(
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        if self.peft_config.peft_mode == peft.PEFT_LORA:
+            query_states = self.peft_q_proj_lora(query_states)
+            value_states = self.peft_v_proj_lora(value_states)
+        if self.peft_config.peft_mode == peft.PEFT_IA3:
+            key_states, value_states = self.peft_ia3(key_states, value_states)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            query_states = self.peft_q_proj_bias(query_states)
+            key_states = self.peft_k_proj_bias(key_states)
+            value_states = self.peft_v_proj_bias(value_states)
+
+        query_states = query_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
+        key_states = key_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
+        value_states = value_states.view(
             batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
+
         if kv_cache:
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
             value_states = torch.cat([kv_cache["value"], value_states], dim=2)
@@ -433,11 +559,18 @@ class Attention(nn.Module):
             value=value_states,
             attn_mask=attention_mask,
         )
+
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX_ADAPTER:
+            attn_output = attn_output + self.peft_prefix_adapter(query_states=query_states)
+
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
         )
         attn_output = self.o_proj(attn_output)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            attn_output = self.peft_o_proj_bias(attn_output)
+
         check_nan(attn_output)
         if kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
@@ -565,7 +698,7 @@ def check_nan(x):
         pdb.set_trace()
 
 
-def create_model(model_name, hf_path, use_8bit=False, device=None):
+def create_model(model_name, hf_path, peft_config: peft.PeftConfig, use_8bit=False, device=None):
     config = LLAMA_CONFIG_DICT[model_name]
 
     with open(os.path.join(hf_path, "pytorch_model.bin.index.json")) as f:
@@ -578,7 +711,7 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
     if use_8bit:
         config = dataclasses.replace(config, use_8bit=True)
         with init_empty_weights():
-            model = LLaMAModel(config=config)
+            model = LLaMAModel(config=config, peft_config=peft_config)
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
@@ -590,7 +723,7 @@ def create_model(model_name, hf_path, use_8bit=False, device=None):
     else:
         # noinspection PyUnresolvedReferences
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = LLaMAModel(config=config).cuda()
+        model = LLaMAModel(config=config, peft_config=peft_config).cuda()
         torch.set_default_tensor_type(torch.FloatTensor)
         state_keys = set(model.state_dict())
         for filename in tqdm.tqdm(filename_list):
@@ -649,3 +782,7 @@ def create_rope_embed_ids(input_ids):
     x = (input_ids != pad_token_id).cumsum(-1) - 1
     x[input_ids == pad_token_id] = max_position
     return x
+
+
+def zeros_like(shape, tensor):
+    return torch.zeros(shape).type_as(tensor).to(tensor.device)
