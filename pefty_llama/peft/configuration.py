@@ -18,7 +18,7 @@ class PeftConfig:
     peft_mode: str
 
     # Used by prompt, prefix, prefix_adapter
-    num_prefix_tokens: int = None
+    num_prefix_tokens: int = 16
 
     # Prefix
     prefix_use_mlp: bool = True

@@ -16,7 +16,7 @@ class PrefixAdapter(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1, config.n_heads, 1, 1))
 
     def forward(self, query_states):
-        batch_size, q_seq_len, dim = query_states.shape
+        batch_size, num_heads, q_seq_len, head_dim = query_states.shape
         # "batch_size"=1, num_heads, num_prefix_tokens, head_dim
         prefix_k = self.prefix_k.expand(batch_size, -1, -1, -1)
         prefix_v = self.prefix_v.expand(batch_size, -1, -1, -1)
