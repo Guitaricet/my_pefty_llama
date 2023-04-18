@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-class BitFitBias(nn.Module):
+class BitFitAddBias(nn.Module):
     def __init__(self, dim: int, dtype=torch.float16):
         super().__init__()
         self.bias = nn.Parameter(torch.zeros(dim, dtype=dtype))

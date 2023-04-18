@@ -287,8 +287,8 @@ class LLaMALayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
 
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            self.peft_input_layernorm_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
-            self.peft_post_attention_layernorm_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+            self.peft_input_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_post_attention_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
 
     def forward(
         self,
@@ -362,9 +362,9 @@ class MLP(nn.Module):
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             self.peft_ia3 = peft.IA3ForMLP(config)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            self.peft_gate_proj_bias = peft.BitFitBias(dim=hidden_dim, dtype=config.dtype)
-            self.peft_up_proj_bias = peft.BitFitBias(dim=hidden_dim, dtype=config.dtype)
-            self.peft_down_proj_bias = peft.BitFitBias(dim=dim, dtype=config.dtype)
+            self.peft_gate_proj_bias = peft.BitFitAddBias(dim=hidden_dim, dtype=config.dtype)
+            self.peft_up_proj_bias = peft.BitFitAddBias(dim=hidden_dim, dtype=config.dtype)
+            self.peft_down_proj_bias = peft.BitFitAddBias(dim=dim, dtype=config.dtype)
 
     def forward(self, x):
         gate_proj = self.gate_proj(x)
@@ -418,13 +418,16 @@ class Attention(nn.Module):
             self.o_proj = NoInitLinear(config.dim, config.dim, bias=False, dtype=config.dtype)
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
+        if self.peft_config.peft_mode == peft.PEFT_LORA:
+            self.peft_q_proj_lora = peft.LoRA(config=config, peft_config=peft_config)
+            self.peft_v_proj_lora = peft.LoRA(config=config, peft_config=peft_config)
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             self.peft_ia3 = peft.IA3ForAttn(config)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            self.peft_q_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
-            self.peft_k_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
-            self.peft_v_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
-            self.peft_o_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+            self.peft_q_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_k_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_v_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_o_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
 
     def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
         """
@@ -438,6 +441,9 @@ class Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        if self.peft_config.peft_mode == peft.PEFT_LORA:
+            query_states = self.peft_q_proj_lora(query_states)
+            value_states = self.peft_v_proj_lora(value_states)
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             key_states, value_states = self.peft_ia3(key_states, value_states)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
