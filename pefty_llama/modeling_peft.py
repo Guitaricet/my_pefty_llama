@@ -372,7 +372,7 @@ class LLaMALayer(nn.Module):
 
         mlp_out = self.mlp(post_normed_hidden_states)
         if self.peft_config.peft_mode == peft.PEFT_ADAPTER:
-            mlp_out = self.peft_adapter_attn(mlp_out)
+            mlp_out = self.peft_adapter_mlp(mlp_out)
 
         hidden_states = hidden_states + mlp_out
         check_nan(hidden_states)
