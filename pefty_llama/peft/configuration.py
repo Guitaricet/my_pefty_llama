@@ -20,6 +20,7 @@ class PeftConfig:
 
     # Prefix
     prefix_use_mlp: bool = True
+    prefix_mlp_hidden_size: int = None
 
     # LoRA
     lora_rank: int = 8

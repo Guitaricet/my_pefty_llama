@@ -30,6 +30,9 @@ class LLaMAModel(nn.Module):
         self.model = LLaMAInnerModel(config=config, peft_config=peft_config)
         self.lm_head = NoInitLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            self.peft_prefixes = peft.SoftPrefixes(config=config, peft_config=peft_config)
+
     @classmethod
     def from_pretrained(cls, model_name_or_path, use_8bit=False):
         """Load model from a huggingface model name or path."""
@@ -72,8 +75,18 @@ class LLaMAModel(nn.Module):
         # decoder mask
         # [batch_size, num_heads=1, q_len=seq_len, kv_len=seq_len]
         attention_mask = create_attention_mask(input_ids=input_ids, dtype=self.config.dtype)
+        if self.peft_config.peft_mode in (peft.PEFT_PREFIX, peft.PEFT_PROMPT):
+            attention_mask = torch.cat([
+                zeros_like([1, 1, input_ids.shape[1], self.peft_config.num_prefix_tokens], tensor=attention_mask),
+                attention_mask,
+            ], dim=3)
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
+
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            kv_cache = self.peft_prefixes(batch_size=input_ids.shape[0])
+        else:
+            kv_cache = None
 
         # 2) Forward pass
         # [batch_size, seq_len, hidden_dim]
@@ -81,6 +94,7 @@ class LLaMAModel(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             cos=cos, sin=sin,
+            kv_cache=kv_cache,
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
@@ -133,7 +147,12 @@ class LLaMAModel(nn.Module):
                 [[self.config.pad_token_id]] * batch_size
             ).to(self.lm_head.weights.device)
         # See: init_kv_cache. list[dict]
-        kv_cache = self.init_kv_cache(input_ids)
+        if self.peft_config.peft_mode == peft.PEFT_PREFIX:
+            kv_cache = self.peft_prefixes(batch_size=input_ids.shape[0])
+            num_valid_kv_cache = num_valid_tokens + self.downstream_config.num_prefix_tokens
+        else:
+            kv_cache = self.init_kv_cache(input_ids)
+            num_valid_kv_cache = num_valid_tokens
         generated_token_ids_list = [original_input_ids]
         total_seq_len = seq_len
 
@@ -147,6 +166,15 @@ class LLaMAModel(nn.Module):
         #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
         #   )]
         # )
+        if self.peft_config.peft_mode in (peft.PEFT_PREFIX, peft.PEFT_PROMPT):
+            num_prefix_tokens = self.peft_config.num_prefix_tokens
+            total_seq_len += num_prefix_tokens
+            # [batch_size, num_heads=1, q_len=seq_len, kv_len=num_prefix_tokens + dec_seq_len]
+            attention_mask = torch.cat([
+                zeros_like([1, 1, input_ids.shape[1], num_prefix_tokens], tensor=attention_mask),
+                attention_mask,
+            ], dim=3)
+
         rope_embed_ids = create_rope_embed_ids(input_ids=input_ids)
         cos, sin = self.get_cos_sin(rope_embed_ids)
         model_out = self.model(
@@ -168,9 +196,9 @@ class LLaMAModel(nn.Module):
         for layer_kv_cache in kv_cache:
             for i in range(batch_size):
                 layer_kv_cache["key"] = shift_kv_cache_right(
-                    layer_kv_cache["key"], num_valid_tokens=num_valid_tokens)
+                    layer_kv_cache["key"], num_valid_tokens=num_valid_kv_cache)
                 layer_kv_cache["value"] = shift_kv_cache_right(
-                    layer_kv_cache["value"], num_valid_tokens=num_valid_tokens)
+                    layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
 
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
@@ -232,6 +260,9 @@ class LLaMAInnerModel(nn.Module):
         ])
         self.norm = RMSNorm(dim=config.dim)
 
+        if self.peft_config.peft_mode == peft.PEFT_PROMPT:
+            self.peft_prompt = peft.AddSoftPrompt(config=config, peft_config=peft_config)
+
     def forward(self,
                 input_ids,
                 attention_mask,
@@ -241,11 +272,14 @@ class LLaMAInnerModel(nn.Module):
         :param input_ids: [batch_size, seq_len]
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
         :param kv_cache: See init_kv_cache.
-            We use the presence of kv_cache to determine if we're generating
-        :param cos:
-        :param sin:
+        :param cos: for RoPE
+        :param sin:for RoPE
         """
         hidden_states = self.embed_tokens(input_ids)
+        if self.peft_config.peft_mode == peft.PEFT_PROMPT:
+            if kv_cache is None or kv_cache[0]["key"].shape[2] == 0:
+                # Only add prompt if kv_cache is None (full forward pass) or if kv_cache is empty (first decode step)
+                hidden_states = self.peft_prompt(hidden_states)
 
         new_kv_cache = []
         for layer_i, layer in enumerate(self.layers):
@@ -688,3 +722,7 @@ def create_rope_embed_ids(input_ids):
     x = (input_ids != pad_token_id).cumsum(-1) - 1
     x[input_ids == pad_token_id] = max_position
     return x
+
+
+def zeros_like(shape, tensor):
+    return torch.zeros(shape).type_as(tensor).to(tensor.device)
