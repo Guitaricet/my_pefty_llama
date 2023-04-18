@@ -19,6 +19,7 @@ from transformers import (
     LlamaForCausalLM as HF_Llama,
 )
 
+
 @dataclasses.dataclass
 class LLaMAConfig:
     dim: int
@@ -241,6 +242,7 @@ class LLaMAModel(nn.Module):
             rope_embed_ids,
             self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0]
         ).to(self.config.dtype)
+        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         return cos, sin
 
 
@@ -646,7 +648,7 @@ def create_casual_attention_mask(seq_len, device):
 
 def create_rope_embed_ids(input_ids):
     pad_token_id = 0
-    max_position = 2047
+    max_position = 2047  # These will not actually be used, as they are masked out by the attention mask
     x = (input_ids != pad_token_id).cumsum(-1) - 1
     x[input_ids == pad_token_id] = max_position
     return x
