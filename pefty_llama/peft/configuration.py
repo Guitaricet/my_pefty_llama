@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 PEFT_PREFIX = "prefix"
 PEFT_PREFIX_ADAPTER = "prefix_adapter"
-PEFT_PROMPT = "prefix_adapter"
+PEFT_PROMPT = "prompt"
 PEFT_HOULSBY_ADAPTER = "houlsby_adapter"
 PEFT_PFEIFFER_ADAPTER = "pfeiffer_adapter"
 PEFT_LORA = "lora"
