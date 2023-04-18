@@ -429,7 +429,7 @@ class MLP(nn.Module):
 
         down_proj = self.down_proj(intermediate_state)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            down_proj = self.peft_down_proj_bias(gate_proj)
+            down_proj = self.peft_down_proj_bias(down_proj)
 
         return down_proj
 
