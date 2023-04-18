@@ -1,14 +1,16 @@
 from dataclasses import dataclass
 
 PEFT_PREFIX = "prefix"
-PEFT_PREFIX_ADAPTER = "prefix_adapter"
 PEFT_PROMPT = "prompt"
-PEFT_HOULSBY_ADAPTER = "houlsby_adapter"
-PEFT_PFEIFFER_ADAPTER = "pfeiffer_adapter"
+PEFT_ADAPTER = "adapter"
+PEFT_PREFIX_ADAPTER = "prefix_adapter"
 PEFT_LORA = "lora"
 PEFT_IA3 = "ia3"
 PEFT_BITFIT = "bitfit"
 NO_PEFT = "nothing"
+
+ADAPTER_VERSION_HOULSBY = "houlsby"
+ADAPTER_VERSION_PFEIFFER = "pfeiffer"
 
 
 @dataclass
@@ -26,11 +28,13 @@ class PeftConfig:
     lora_rank: int = 8
     lora_alpha: int = 16
 
-    # IA3
+    # Adapter
+    adapter_hidden_size: int = 64
+    adapter_version: str = ADAPTER_VERSION_PFEIFFER  # houlsby, pfeiffer
 
     def check(self):
         assert self.peft_mode in (
-            PEFT_PREFIX, PEFT_PREFIX_ADAPTER, PEFT_PROMPT, PEFT_HOULSBY_ADAPTER, PEFT_PFEIFFER_ADAPTER,
+            PEFT_PREFIX, PEFT_PREFIX_ADAPTER, PEFT_PROMPT, PEFT_ADAPTER,
             PEFT_IA3, PEFT_BITFIT,
             NO_PEFT,
         )

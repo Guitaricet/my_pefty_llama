@@ -320,6 +320,11 @@ class LLaMALayer(nn.Module):
         self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
 
+        if self.peft_config.peft_mode == peft.PEFT_ADAPTER:
+            if self.peft_config.adapter_version == "houlsby":
+                self.peft_adapter_attn = peft.Adapter(config=config, peft_config=peft_config)
+            self.peft_adapter_mlp = peft.Adapter(config=config, peft_config=peft_config)
+
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             self.peft_input_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
             self.peft_post_attention_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
@@ -351,14 +356,25 @@ class LLaMALayer(nn.Module):
             cos=cos, sin=sin,
         )
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + raw_self_attn_output["attn_output"]
+        attn_out = raw_self_attn_output["attn_output"]
+        if self.peft_config.peft_mode == peft.PEFT_ADAPTER \
+                and self.peft_config.adapter_version == peft.ADAPTER_VERSION_HOULSBY:
+            attn_out = self.peft_adapter_attn(attn_out)
+
+        # [batch_size, seq_len, hidden_dim]
+        hidden_states = hidden_states + attn_out
         check_nan(hidden_states)
         # 2) FFN
         # [batch_size, seq_len, hidden_dim]
         post_normed_hidden_states = self.post_attention_layernorm(hidden_states)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             post_normed_hidden_states = self.peft_post_attention_layernorm_bias(post_normed_hidden_states)
-        hidden_states = hidden_states + self.mlp(post_normed_hidden_states)
+
+        mlp_out = self.mlp(post_normed_hidden_states)
+        if self.peft_config.peft_mode == peft.PEFT_ADAPTER:
+            mlp_out = self.peft_adapter_attn(mlp_out)
+
+        hidden_states = hidden_states + mlp_out
         check_nan(hidden_states)
         if kv_cache:
             return {
