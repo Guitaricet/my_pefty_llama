@@ -132,8 +132,8 @@ class LLaMAModel(nn.Module):
         for layer in self.model.layers:
             device = layer.input_layernorm.weight.device
             kv_cache.append({
-                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
-                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device),
+                "key": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
+                "value": torch.zeros([batch_size, num_heads, 0, head_dim]).to(device=device, dtype=self.config.dtype),
             })
         return kv_cache
 
@@ -427,15 +427,12 @@ class Attention(nn.Module):
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
             value_states = torch.cat([kv_cache["value"], value_states], dim=2)
 
-        scores = torch.matmul(
-            query_states, key_states.transpose(3, 2).type_as(query_states) / math.sqrt(self.head_dim)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            attn_mask=attention_mask,
         )
-        scores += attention_mask
-
-        # (batch_size, num_heads, q_seq_len, kv_seq_len)
-        attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
-        # (batch_size, num_heads, q_seq_len, head_dim)
-        attn_output = torch.matmul(attn_weights, value_states.type_as(query_states))
         # (batch_size, q_seq_len, hidden_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, q_seq_len, hidden_dim,
