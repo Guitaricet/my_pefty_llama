@@ -6,6 +6,7 @@ PEFT_PROMPT = "prefix_adapter"
 PEFT_HOULSBY_ADAPTER = "houlsby_adapter"
 PEFT_PFEIFFER_ADAPTER = "pfeiffer_adapter"
 PEFT_IA3 = "ia3"
+PEFT_BITFIT = "bitfit"
 NO_PEFT = "nothing"
 
 
@@ -28,6 +29,6 @@ class PeftConfig:
     def check(self):
         assert self.peft_mode in (
             PEFT_PREFIX, PEFT_PREFIX_ADAPTER, PEFT_PROMPT, PEFT_HOULSBY_ADAPTER, PEFT_PFEIFFER_ADAPTER,
-            PEFT_IA3,
+            PEFT_IA3, PEFT_BITFIT,
             NO_PEFT,
         )

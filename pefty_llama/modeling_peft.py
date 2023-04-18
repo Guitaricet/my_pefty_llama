@@ -19,35 +19,7 @@ from transformers import (
     LlamaForCausalLM as HF_Llama,
 )
 import pefty_llama.peft as peft
-
-
-@dataclasses.dataclass
-class LLaMAConfig:
-    dim: int
-    n_layers: int
-    n_heads: int
-    vocab_size: int = 32000
-    max_seq_length: int = 2048
-    dtype = torch.float16
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    use_8bit: bool = False
-
-    @property
-    def head_dim(self):
-        return self.dim // self.n_heads
-
-
-LLAMA_7B_CONFIG = LLaMAConfig(
-    dim=4096,
-    n_layers=32,
-    n_heads=32,
-)
-
-LLAMA_CONFIG_DICT = {
-    "7b": LLAMA_7B_CONFIG,
-}
+from pefty_llama.configuration import LLaMAConfig, LLAMA_CONFIG_DICT
 
 
 class LLaMAModel(nn.Module):
@@ -314,6 +286,10 @@ class LLaMALayer(nn.Module):
         self.input_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
         self.post_attention_layernorm = RMSNorm(dim=config.dim, dtype=config.dtype)
 
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            self.peft_input_layernorm_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+            self.peft_post_attention_layernorm_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+
     def forward(
         self,
         hidden_states,
@@ -324,6 +300,8 @@ class LLaMALayer(nn.Module):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
         normed_hidden_states = self.input_layernorm(hidden_states)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            normed_hidden_states = self.peft_input_layernorm_bias(normed_hidden_states)
         # dict(
         #   attn_output = [batch_size, seq_len, hidden_dim]
         #   kv_cache = dict(
@@ -343,7 +321,10 @@ class LLaMALayer(nn.Module):
         check_nan(hidden_states)
         # 2) FFN
         # [batch_size, seq_len, hidden_dim]
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        post_normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            post_normed_hidden_states = self.peft_post_attention_layernorm_bias(post_normed_hidden_states)
+        hidden_states = hidden_states + self.mlp(post_normed_hidden_states)
         check_nan(hidden_states)
         if kv_cache:
             return {
@@ -379,13 +360,28 @@ class MLP(nn.Module):
             self.down_proj = NoInitLinear(hidden_dim, dim, bias=False, dtype=config.dtype)
 
         if self.peft_config.peft_mode == peft.PEFT_IA3:
-            self.ia3 = peft.IA3ForMLP(config)
+            self.peft_ia3 = peft.IA3ForMLP(config)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            self.peft_gate_proj_bias = peft.BitFitBias(dim=hidden_dim, dtype=config.dtype)
+            self.peft_up_proj_bias = peft.BitFitBias(dim=hidden_dim, dtype=config.dtype)
+            self.peft_down_proj_bias = peft.BitFitBias(dim=dim, dtype=config.dtype)
 
     def forward(self, x):
-        intermediate_state = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        gate_proj = self.gate_proj(x)
+        up_proj = self.up_proj(x)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            gate_proj = self.peft_gate_proj_bias(gate_proj)
+            up_proj = self.peft_gate_proj_bias(up_proj)
+
+        intermediate_state = F.silu(gate_proj * up_proj)
         if self.peft_config.peft_mode == peft.PEFT_IA3:
-            intermediate_state = self.ia3(intermediate_state)
-        return self.down_proj(intermediate_state)
+            intermediate_state = self.peft_ia3(intermediate_state)
+
+        down_proj = self.down_proj(intermediate_state)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            down_proj = self.peft_down_proj_bias(gate_proj)
+
+        return down_proj
 
 
 class RMSNorm(torch.nn.Module):
@@ -423,7 +419,12 @@ class Attention(nn.Module):
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
         if self.peft_config.peft_mode == peft.PEFT_IA3:
-            self.ia3 = peft.IA3ForAttn(config)
+            self.peft_ia3 = peft.IA3ForAttn(config)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            self.peft_q_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+            self.peft_k_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+            self.peft_v_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
+            self.peft_o_proj_bias = peft.BitFitBias(dim=config.dim, dtype=config.dtype)
 
     def forward(self, hidden_states, attention_mask, cos, sin, kv_cache=None):
         """
@@ -433,16 +434,24 @@ class Attention(nn.Module):
         batch_size, q_seq_len, hidden_dim = hidden_states.size()
 
         # (batch_size, num_heads, q_seq_len, head_dim)
-        query_states = self.q_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
-            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
         if self.peft_config.peft_mode == peft.PEFT_IA3:
-            key_states, value_states = self.ia3(key_states, value_states)
+            key_states, value_states = self.peft_ia3(key_states, value_states)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            query_states = self.peft_q_proj_bias(query_states)
+            key_states = self.peft_k_proj_bias(key_states)
+            value_states = self.peft_v_proj_bias(value_states)
+
+        query_states = query_states.view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(
+            batch_size, q_seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos=cos, sin=sin)
 
         if kv_cache:
             key_states = torch.cat([kv_cache["key"], key_states], dim=2)
@@ -459,6 +468,9 @@ class Attention(nn.Module):
             batch_size, q_seq_len, hidden_dim,
         )
         attn_output = self.o_proj(attn_output)
+        if self.peft_config.peft_mode == peft.PEFT_BITFIT:
+            attn_output = self.peft_o_proj_bias(attn_output)
+
         check_nan(attn_output)
         if kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
