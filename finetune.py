@@ -18,7 +18,7 @@ from transformers import (
     TrainingArguments,
 )
 from pefty_llama.peft import PeftConfig
-from pefty_llama.modeling_peft import create_model
+from pefty_llama.modeling_peft import create_model, set_peft_requires_grad
 
 
 @dataclass
@@ -114,6 +114,7 @@ def main():
         hf_path=finetune_args.hf_path,
         use_8bit=finetune_args.use_8bit,
     )
+    set_peft_requires_grad(model)
     if finetune_args.use_8bit:
         model.lm_head = CastOutputToFloat(model.lm_head)
     if training_args.gradient_checkpointing:

@@ -274,9 +274,6 @@ class LLaMAInnerModel(nn.Module):
                 # Only add prompt if kv_cache is None (full forward pass) or if kv_cache is empty (first decode step)
                 hidden_states = self.peft_prompt(hidden_states)
 
-        if self.config.gradient_checkpointing:
-            hidden_states.requires_grad_(True)
-
         new_kv_cache = []
         for layer_i, layer in enumerate(self.layers):
             if kv_cache:
@@ -303,10 +300,9 @@ class LLaMAInnerModel(nn.Module):
                     cos=cos, sin=sin,
                     kv_cache=layer_kv_cache,
                 )
-
-            hidden_states = layer_out["hidden_states"]
+            hidden_states, out_layer_kv_cache = layer_out
             if kv_cache:
-                new_kv_cache.append(layer_out["kv_cache"])
+                new_kv_cache.append(out_layer_kv_cache)
         hidden_states = self.norm(hidden_states)
         output = {
             "hidden_states": hidden_states
@@ -382,13 +378,18 @@ class LLaMALayer(nn.Module):
 
         hidden_states = hidden_states + mlp_out
         check_nan(hidden_states)
+        # if kv_cache:
+        #     return {
+        #         "hidden_states": hidden_states,
+        #         "kv_cache": raw_self_attn_output["kv_cache"],
+        #     }
+        #
+        # return {"hidden_states": hidden_states}
         if kv_cache:
-            return {
-                "hidden_states": hidden_states,
-                "kv_cache": raw_self_attn_output["kv_cache"],
-            }
+            return hidden_states, raw_self_attn_output["kv_cache"]
+        else:
+            return hidden_states, None
 
-        return {"hidden_states": hidden_states}
 
 
 class MLP(nn.Module):
@@ -661,9 +662,10 @@ class NoInitEmbedding(nn.Embedding):
 
 
 def check_nan(x):
-    if torch.isnan(x).any():
-        import pdb
-        pdb.set_trace()
+    # if torch.isnan(x).any():
+    #     import pdb
+    #     pdb.set_trace()
+    pass
 
 
 def create_model(model_name, hf_path, peft_config: peft.PeftConfig, use_8bit=False, device=None):
@@ -680,6 +682,8 @@ def create_model(model_name, hf_path, peft_config: peft.PeftConfig, use_8bit=Fal
         config = dataclasses.replace(config, use_8bit=True)
         with init_empty_weights():
             model = LLaMAModel(config=config, peft_config=peft_config)
+        if model_name == "debug":
+            return model
         state_keys = set(model.state_dict())
         filename_list = sorted(list(set(weight_map.values())))
         for filename in tqdm.tqdm(filename_list):
@@ -693,14 +697,14 @@ def create_model(model_name, hf_path, peft_config: peft.PeftConfig, use_8bit=Fal
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = LLaMAModel(config=config, peft_config=peft_config).cuda()
         torch.set_default_tensor_type(torch.FloatTensor)
+        if model_name == "debug":
+            return model
         state_keys = set(model.state_dict())
         for filename in tqdm.tqdm(filename_list):
             loaded = torch.load(os.path.join(hf_path, filename), map_location="cpu")
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
-
-    set_peft_requires_grad(model)
     return model
 
 
