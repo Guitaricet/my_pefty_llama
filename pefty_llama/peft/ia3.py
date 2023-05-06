@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from pefty_llama.modeling import LLaMAModel, NoInitLinear, NoInit8bitLinear, RotaryEmbedding, apply_rotary_pos_emb, check_nan
 from pefty_llama.configuration import LLaMAConfig
+from .configuration import PeftConfig
 
 
 class IA3Attention(nn.Module):
@@ -153,29 +154,34 @@ class IA3(nn.Module):
 
 
 class IA3ForAttn(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: PeftConfig):
         super().__init__()
         self.config = config
+        self.peft_config = peft_config
         self.n_heads = config.n_heads
         self.head_dim = config.dim // config.n_heads
 
-        self.peft_l_k = nn.Parameter(torch.ones(config.dim, dtype=config.dtype))
-        self.peft_l_v = nn.Parameter(torch.ones(config.dim, dtype=config.dtype))
+        self.peft_l_k = nn.Parameter(torch.ones(config.dim, dtype=peft_config.peft_dtype))
+        self.peft_l_v = nn.Parameter(torch.ones(config.dim, dtype=peft_config.peft_dtype))
 
     def forward(self, key_states, value_states):
-        return key_states * self.peft_l_k, value_states * self.peft_l_v
+        return (
+            (key_states.to(self.peft_config.peft_dtype) * self.peft_l_k).to(self.config.dtype),
+            (value_states.to(self.peft_config.peft_dtype) * self.peft_l_v).to(self.config.dtype),
+        )
 
 
 class IA3ForMLP(nn.Module):
-    def __init__(self, config: LLaMAConfig):
+    def __init__(self, config: LLaMAConfig, peft_config: PeftConfig):
         super().__init__()
         self.config = config
+        self.peft_config = peft_config
         multiple_of = 256
         intermediate_dim = 4 * config.dim
         intermediate_dim = int(2 * intermediate_dim / 3)
         intermediate_dim = multiple_of * ((intermediate_dim + multiple_of - 1) // multiple_of)
 
-        self.peft_l_ffn = nn.Parameter(torch.ones(1, 1, intermediate_dim, dtype=config.dtype))
+        self.peft_l_ffn = nn.Parameter(torch.ones(1, 1, intermediate_dim, dtype=peft_config.peft_dtype))
 
     def forward(self, intermediate_state):
-        return self.peft_l_ffn * intermediate_state
+        return (intermediate_state.to(self.peft_config.peft_dtype) * self.peft_l_ffn).to(self.config.dtype)

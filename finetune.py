@@ -81,7 +81,7 @@ class ModifiedTrainer(Trainer):
         pass
 
 
-def c4_data_collator(features: list) -> dict:
+def data_collator(features: list) -> dict:
     return {
         "input_ids": torch.stack([torch.LongTensor(f["input_ids"]) for f in features]),
     }
@@ -106,7 +106,6 @@ def main():
     print("Setup Data")
     training_args.remove_unused_columns = False
     dataset = datasets.load_from_disk(finetune_args.dataset_path)
-    data_collator = c4_data_collator
 
     print("Setup Model")
     model = create_model(
@@ -115,16 +114,12 @@ def main():
         hf_path=finetune_args.hf_path,
         use_8bit=finetune_args.use_8bit,
     )
-    model.config.use_new_attention = finetune_args.use_new_attention
-    model.lm_head = CastOutputToFloat(model.lm_head)
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
-
-    if finetune_args.compile:
-        print("Compiling model")
-        model = torch.compile(model)
-    else:
-        print("Not compiling model")
+    if finetune_args.use_8bit:
+        model.lm_head = CastOutputToFloat(model.lm_head)
+    if training_args.gradient_checkpointing:
+        print("Enabling gradient checkpointing")
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
     print("Train")
     trainer = ModifiedTrainer(

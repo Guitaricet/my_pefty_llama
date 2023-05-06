@@ -1,4 +1,7 @@
+from typing import Any
 from dataclasses import dataclass, field
+
+import torch
 
 PEFT_PREFIX = "prefix"
 PEFT_PROMPT = "prompt"
@@ -16,6 +19,7 @@ ADAPTER_VERSION_PFEIFFER = "pfeiffer"
 @dataclass
 class PeftConfig:
     peft_mode: str = field()
+    peft_dtype: Any = field(default=torch.float32)
 
     # Used by prompt, prefix, prefix_adapter
     num_prefix_tokens: int = field(default=16)

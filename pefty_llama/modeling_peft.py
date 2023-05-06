@@ -33,37 +33,6 @@ class LLaMAModel(nn.Module):
         if self.peft_config.peft_mode == peft.PEFT_PREFIX:
             self.peft_prefixes = peft.SoftPrefixes(config=config, peft_config=peft_config)
 
-    @classmethod
-    def from_pretrained(cls, model_name_or_path, use_8bit=False):
-        """Load model from a huggingface model name or path."""
-        hf_config = HF_LlamaConfig.from_pretrained(model_name_or_path)
-
-        config = LLaMAConfig(
-            vocab_size=hf_config.vocab_size,
-            dim=hf_config.hidden_size,
-            n_layers=hf_config.num_hidden_layers,
-            n_heads=hf_config.num_attention_heads,
-            max_seq_length=hf_config.max_position_embeddings,
-            dtype=hf_config.dtype,
-            pad_token_id=hf_config.pad_token_id,
-            bos_token_id=hf_config.bos_token_id,
-            eos_token_id=hf_config.eos_token_id,
-            use_8bit=use_8bit,
-        )
-
-        raise NotImplementedError()
-        model = cls(config)
-
-        # Load weights from huggingface model to the disk if needed
-        if os.path.isdir(model_name_or_path):
-            hf_model_path = model_name_or_path
-        else:
-            hf_model_path = hf_config.cache_dir
-            hf_model = HF_LLaMA.from_pretrained(hf_model_path, config=hf_config)
-            hf_model.save_pretrained(hf_model_path)
-
-        return model
-
     def forward(self,
                 input_ids):
         """Forward pass (with full decode sequence, intended for training or loss-scoring)
@@ -135,7 +104,8 @@ class LLaMAModel(nn.Module):
             })
         return kv_cache
 
-    def generate(self, input_ids, generation_length: 20):
+    def generate(self, input_ids, generation_length: int = 20,
+                 return_output_only=True):
         """Generate tokens with efficient caching of KV.
 
         TODO: Add stopping conditions
@@ -143,6 +113,7 @@ class LLaMAModel(nn.Module):
 
         :param input_ids: [batch_size, enc_seq_len]
         :param generation_length: int
+        :param return_output_only:
         :return: [batch_size, generation_length]
         """
         original_input_ids = input_ids
@@ -211,14 +182,6 @@ class LLaMAModel(nn.Module):
         generated_token_ids_list.append(generated_token_ids)
         input_ids = generated_token_ids
 
-        # 2.1 shift KV cache
-        for layer_kv_cache in kv_cache:
-            for i in range(batch_size):
-                layer_kv_cache["key"] = shift_kv_cache_right(
-                    layer_kv_cache["key"], num_valid_tokens=num_valid_kv_cache)
-                layer_kv_cache["value"] = shift_kv_cache_right(
-                    layer_kv_cache["value"], num_valid_tokens=num_valid_kv_cache)
-
         # 3) Subsequent steps
         for decode_step in range(generation_length-1):
             num_valid_tokens += 1
@@ -237,7 +200,7 @@ class LLaMAModel(nn.Module):
             #     value = [batch_size, num_heads, kv_seq_len=decode_step+1, head_dim]
             #   )]
             # )
-            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens
+            rope_embed_ids = create_rope_embed_ids(input_ids=input_ids) + num_valid_tokens[:, None]
             cos, sin = self.get_cos_sin(rope_embed_ids)
             model_out = self.model(
                 input_ids=input_ids,
@@ -252,16 +215,19 @@ class LLaMAModel(nn.Module):
             generated_token_ids = logits.argmax(-1)[:, -1:]
             generated_token_ids_list.append(generated_token_ids)
             input_ids = generated_token_ids
-        return torch.cat(generated_token_ids_list, dim=1)
+        output = torch.cat(generated_token_ids_list, dim=1)
+        if return_output_only:
+            output = output[:, seq_len:]
+        return output
 
     def get_cos_sin(self, rope_embed_ids):
         cos = F.embedding(
             rope_embed_ids,
-            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0]
+            self.model.layers[0].self_attn.rotary_emb.cos_cached[0, 0].to(rope_embed_ids.device)
         ).to(self.config.dtype)
         sin = F.embedding(
             rope_embed_ids,
-            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0]
+            self.model.layers[0].self_attn.rotary_emb.sin_cached[0, 0].to(rope_embed_ids.device)
         ).to(self.config.dtype)
         cos, sin = cos[:, None, :, :], sin[:, None, :, :]
         return cos, sin
@@ -273,7 +239,6 @@ class LLaMAModel(nn.Module):
         def make_inputs_require_grads(module, input, output):
             output.requires_grad_(True)
         self.model.embed_tokens.register_forward_hook(make_inputs_require_grads)
-
 
 
 class LLaMAInnerModel(nn.Module):
@@ -299,15 +264,18 @@ class LLaMAInnerModel(nn.Module):
         """
         :param input_ids: [batch_size, seq_len]
         :param attention_mask: [batch_size=1, num_heads=1, seq_len, seq_len]
-        :param kv_cache: See init_kv_cache.
         :param cos: for RoPE
         :param sin: for RoPE
+        :param kv_cache: See init_kv_cache.
         """
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids).to(self.config.dtype)
         if self.peft_config.peft_mode == peft.PEFT_PROMPT:
             if kv_cache is None or kv_cache[0]["key"].shape[2] == 0:
                 # Only add prompt if kv_cache is None (full forward pass) or if kv_cache is empty (first decode step)
                 hidden_states = self.peft_prompt(hidden_states)
+
+        if self.config.gradient_checkpointing:
+            hidden_states.requires_grad_(True)
 
         new_kv_cache = []
         for layer_i, layer in enumerate(self.layers):
@@ -325,15 +293,15 @@ class LLaMAInnerModel(nn.Module):
                     layer,
                     hidden_states,
                     attention_mask,
-                    kv_cache,
                     cos, sin,
+                    layer_kv_cache,
                 )
             else:
                 layer_out = layer(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
-                    kv_cache=layer_kv_cache,
                     cos=cos, sin=sin,
+                    kv_cache=layer_kv_cache,
                 )
 
             hidden_states = layer_out["hidden_states"]
@@ -364,8 +332,8 @@ class LLaMALayer(nn.Module):
             self.peft_adapter_mlp = peft.Adapter(config=config, peft_config=peft_config)
 
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            self.peft_input_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
-            self.peft_post_attention_layernorm_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_input_layernorm_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
+            self.peft_post_attention_layernorm_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
 
     def forward(
         self,
@@ -376,7 +344,7 @@ class LLaMALayer(nn.Module):
     ):
         # 1) Self-attention
         # [batch_size, seq_len, hidden_dim]
-        normed_hidden_states = self.input_layernorm(hidden_states)
+        normed_hidden_states = self.input_layernorm(hidden_states).to(self.config.dtype)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             normed_hidden_states = self.peft_input_layernorm_bias(normed_hidden_states)
         # dict(
@@ -450,9 +418,9 @@ class MLP(nn.Module):
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             self.peft_ia3 = peft.IA3ForMLP(config)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            self.peft_gate_proj_bias = peft.BitFitAddBias(dim=hidden_dim, dtype=config.dtype)
-            self.peft_up_proj_bias = peft.BitFitAddBias(dim=hidden_dim, dtype=config.dtype)
-            self.peft_down_proj_bias = peft.BitFitAddBias(dim=dim, dtype=config.dtype)
+            self.peft_gate_proj_bias = peft.BitFitAddBias(dim=hidden_dim, peft_config=peft_config)
+            self.peft_up_proj_bias = peft.BitFitAddBias(dim=hidden_dim, peft_config=peft_config)
+            self.peft_down_proj_bias = peft.BitFitAddBias(dim=dim, peft_config=peft_config)
 
     def forward(self, x):
         gate_proj = self.gate_proj(x)
@@ -461,7 +429,7 @@ class MLP(nn.Module):
             gate_proj = self.peft_gate_proj_bias(gate_proj)
             up_proj = self.peft_gate_proj_bias(up_proj)
 
-        intermediate_state = F.silu(gate_proj * up_proj)
+        intermediate_state = F.silu(gate_proj) * up_proj
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             intermediate_state = self.peft_ia3(intermediate_state)
 
@@ -512,10 +480,10 @@ class Attention(nn.Module):
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             self.peft_ia3 = peft.IA3ForAttn(config)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
-            self.peft_q_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
-            self.peft_k_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
-            self.peft_v_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
-            self.peft_o_proj_bias = peft.BitFitAddBias(dim=config.dim, dtype=config.dtype)
+            self.peft_q_proj_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
+            self.peft_k_proj_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
+            self.peft_v_proj_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
+            self.peft_o_proj_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
         if self.peft_config.peft_mode == peft.PEFT_PREFIX_ADAPTER:
             self.peft_prefix_adapter = peft.PrefixAdapter(config=config, peft_config=peft_config)
 
@@ -575,8 +543,8 @@ class Attention(nn.Module):
         if kv_cache:
             new_kv_cache = {"key": key_states, "value": value_states}
             return {"attn_output": attn_output, "kv_cache": new_kv_cache}
-
-        return {"attn_output": attn_output}
+        else:
+            return {"attn_output": attn_output}
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -731,24 +699,39 @@ def create_model(model_name, hf_path, peft_config: peft.PeftConfig, use_8bit=Fal
             model.load_state_dict(loaded, strict=False)
             for k in loaded:
                 state_keys.remove(k)
+
+    set_peft_requires_grad(model)
     return model
 
 
-def shift_kv_cache_right(layer_cache, num_valid_tokens):
-    """
-    :param layer_cache: left-aligned kv cache element, [batch_size, num_heads, seq_len, dim]
-    :param num_valid_tokens: [batch_size]
-    :return:
-    """
-    batch_size = layer_cache.shape[0]
-    # noinspection PyUnresolvedReferences
-    return torch.stack([
-        torch.cat([
-            layer_cache[i, :, num_valid_tokens[i]:, :],
-            layer_cache[i, :, :num_valid_tokens[i], :],
-        ], dim=1)
-        for i in range(batch_size)
-    ], dim=0)
+def set_peft_requires_grad(model: LLaMAModel):
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if model.peft_config.peft_mode == peft.PEFT_PREFIX:
+        _set_requires_grad_if_str_in_name(model, substr="peft_prefix")
+    elif model.peft_config.peft_mode == peft.PEFT_PROMPT:
+        _set_requires_grad_if_str_in_name(model, substr="peft_prompt")
+    elif model.peft_config.peft_mode == peft.PEFT_ADAPTER:
+        _set_requires_grad_if_str_in_name(model, substr="peft_adapter_")
+    elif model.peft_config.peft_mode == peft.PEFT_PREFIX_ADAPTER:
+        _set_requires_grad_if_str_in_name(model, substr="peft_prefix_adapter")
+    elif model.peft_config.peft_mode == peft.PEFT_LORA:
+        _set_requires_grad_if_str_in_name(model, substr="_lora")
+    elif model.peft_config.peft_mode == peft.PEFT_IA3:
+        _set_requires_grad_if_str_in_name(model, substr="ia3")
+    elif model.peft_config.peft_mode == peft.PEFT_BITFIT:
+        _set_requires_grad_if_str_in_name(model, substr="bias")
+    elif model.peft_config.peft_mode == peft.NO_PEFT:
+        pass
+    else:
+        raise KeyError(model.peft_config.peft_mode)
+
+
+def _set_requires_grad_if_str_in_name(model, substr):
+    for n, p in model.named_parameters():
+        if substr in n:
+            p.requires_grad_(True)
+            print(f"Tuning: {n}")
 
 
 def create_generation_attention_mask(batch_size, seq_len, num_valid_tokens, device):

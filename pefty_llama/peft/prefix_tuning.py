@@ -15,16 +15,18 @@ class SoftPrefixes(nn.Module):
             else:
                 intermediate_size = self.config.dim
 
-            self.initial = nn.Parameter(torch.randn(peft_config.num_prefix_tokens, config.dim, dtype=config.dtype))
+            self.initial = nn.Parameter(
+                torch.randn(peft_config.num_prefix_tokens, config.dim, dtype=peft_config.peft_dtype)
+            )
             self.mlp = torch.nn.Sequential(
-                torch.nn.Linear(config.dim, intermediate_size),
+                torch.nn.Linear(config.dim, intermediate_size, dtype=peft_config.peft_dtype),
                 torch.nn.Tanh(),
-                torch.nn.Linear(intermediate_size, config.n_layers * 2 * config.dim),
+                torch.nn.Linear(intermediate_size, config.n_layers * 2 * config.dim, dtype=peft_config.peft_dtype),
             )
         else:
             self.soft_prompt = nn.Parameter(torch.randn(
                 peft_config.num_prefix_tokens, config.n_layers * 2 * config.dim,
-                dtype=config.dtype,
+                dtype=peft_config.peft_dtype
             ))
 
     def forward(self, batch_size):
@@ -34,7 +36,7 @@ class SoftPrefixes(nn.Module):
             out = self.embedding
         # layers, k/v, num_prefix_tokens, num_heads, head_dim
         out = out.view(self.peft_config.num_prefix_tokens, self.config.n_layers, 2,
-                       self.config.n_heads, self.config.head_dim)
+                       self.config.n_heads, self.config.head_dim).to(self.config.dtype)
         return [
             {
                 "key": out[:, layer, 0, :, :].permute(1, 0, 2).unsqueeze(0).expand(batch_size, -1, -1, -1),
