@@ -31,6 +31,8 @@ class PeftConfig:
     # LoRA
     lora_rank: int = field(default=8)
     lora_alpha: int = field(default=16)
+    lora_mlp: bool = field(default=False)
+    lora_embedding: bool = field(default=False)
 
     # Adapter
     adapter_hidden_size: int = field(default=64)

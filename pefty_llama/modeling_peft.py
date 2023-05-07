@@ -32,6 +32,9 @@ class LLaMAModel(nn.Module):
 
         if self.peft_config.peft_mode == peft.PEFT_PREFIX:
             self.peft_prefixes = peft.SoftPrefixes(config=config, peft_config=peft_config)
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_embedding:
+            self.peft_lora_lm_head = peft.LoRA(config=config, peft_config=peft_config,
+                                               output_dim=config.vocab_size)
 
     def forward(self,
                 input_ids):
@@ -77,6 +80,8 @@ class LLaMAModel(nn.Module):
         )
         # [batch_size, seq_len, vocab_size]
         logits = self.lm_head(model_out["hidden_states"])
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_embedding:
+            logits += self.peft_lora_lm_head(model_out["hidden_states"])
         return logits
 
     def init_kv_cache(self, input_ids):
@@ -256,6 +261,9 @@ class LLaMAInnerModel(nn.Module):
         if self.peft_config.peft_mode == peft.PEFT_PROMPT:
             self.peft_prompt = peft.AddSoftPrompt(config=config, peft_config=peft_config)
 
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_embedding:
+            self.peft_lora_embed = peft.LoRAEmbed(config=config, peft_config=peft_config)
+
     def forward(self,
                 input_ids,
                 attention_mask,
@@ -269,6 +277,9 @@ class LLaMAInnerModel(nn.Module):
         :param kv_cache: See init_kv_cache.
         """
         hidden_states = self.embed_tokens(input_ids).to(self.config.dtype)
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_embedding:
+            hidden_states += self.peft_lora_embed(input_ids).to(self.config.dtype)
+
         if self.peft_config.peft_mode == peft.PEFT_PROMPT:
             if kv_cache is None or kv_cache[0]["key"].shape[2] == 0:
                 # Only add prompt if kv_cache is None (full forward pass) or if kv_cache is empty (first decode step)
@@ -391,7 +402,6 @@ class LLaMALayer(nn.Module):
             return hidden_states, None
 
 
-
 class MLP(nn.Module):
     def __init__(
         self,
@@ -416,8 +426,15 @@ class MLP(nn.Module):
             self.up_proj = NoInitLinear(dim, hidden_dim, bias=False, dtype=config.dtype)
             self.down_proj = NoInitLinear(hidden_dim, dim, bias=False, dtype=config.dtype)
 
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_mlp:
+            self.gate_proj_lora = peft.LoRA(config=config, peft_config=peft_config,
+                                            input_dim=dim, output_dim=hidden_dim)
+            self.up_proj_lora = peft.LoRA(config=config, peft_config=peft_config,
+                                          input_dim=dim, output_dim=hidden_dim)
+            self.down_proj_lora = peft.LoRA(config=config, peft_config=peft_config,
+                                            input_dim=dim, output_dim=hidden_dim)
         if self.peft_config.peft_mode == peft.PEFT_IA3:
-            self.peft_ia3 = peft.IA3ForMLP(config)
+            self.peft_ia3 = peft.IA3ForMLP(config, peft_config=peft_config)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             self.peft_gate_proj_bias = peft.BitFitAddBias(dim=hidden_dim, peft_config=peft_config)
             self.peft_up_proj_bias = peft.BitFitAddBias(dim=hidden_dim, peft_config=peft_config)
@@ -426,6 +443,9 @@ class MLP(nn.Module):
     def forward(self, x):
         gate_proj = self.gate_proj(x)
         up_proj = self.up_proj(x)
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_mlp:
+            gate_proj += self.gate_proj_lora(x)
+            up_proj += self.up_proj_lora(x)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             gate_proj = self.peft_gate_proj_bias(gate_proj)
             up_proj = self.peft_gate_proj_bias(up_proj)
@@ -435,6 +455,8 @@ class MLP(nn.Module):
             intermediate_state = self.peft_ia3(intermediate_state)
 
         down_proj = self.down_proj(intermediate_state)
+        if self.peft_config.peft_mode == peft.PEFT_LORA and self.peft_config.lora_mlp:
+            down_proj = self.down_proj_lora(x)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             down_proj = self.peft_down_proj_bias(down_proj)
 
@@ -479,7 +501,7 @@ class Attention(nn.Module):
             self.peft_q_proj_lora = peft.LoRA(config=config, peft_config=peft_config)
             self.peft_v_proj_lora = peft.LoRA(config=config, peft_config=peft_config)
         if self.peft_config.peft_mode == peft.PEFT_IA3:
-            self.peft_ia3 = peft.IA3ForAttn(config)
+            self.peft_ia3 = peft.IA3ForAttn(config, peft_config=peft_config)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
             self.peft_q_proj_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
             self.peft_k_proj_bias = peft.BitFitAddBias(dim=config.dim, peft_config=peft_config)
@@ -501,8 +523,8 @@ class Attention(nn.Module):
         value_states = self.v_proj(hidden_states)
 
         if self.peft_config.peft_mode == peft.PEFT_LORA:
-            query_states = self.peft_q_proj_lora(query_states)
-            value_states = self.peft_v_proj_lora(value_states)
+            query_states += self.peft_q_proj_lora(hidden_states)
+            value_states += self.peft_v_proj_lora(hidden_states)
         if self.peft_config.peft_mode == peft.PEFT_IA3:
             key_states, value_states = self.peft_ia3(key_states, value_states)
         if self.peft_config.peft_mode == peft.PEFT_BITFIT:
